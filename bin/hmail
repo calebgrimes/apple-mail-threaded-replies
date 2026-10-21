@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""hmail: stage REAL threaded Apple Mail replies, and prove a draft is one.
+
+Why this exists: a reply is threaded by two headers, In-Reply-To and References,
+not by "Re:" in the subject. A follow-up staged as a new message with the subject
+"Re: Welcome" looks like a reply and carries neither header, so the recipient's
+mail has nothing to attach it to. Nothing in a plain staging path reads those
+headers, so nothing notices.
+
+    hmail reply --subject "Welcome" --from sender@example.com \\
+                --to client@example.com --body /path/body.txt
+    hmail check "Re: Welcome" --to client@example.com
+
+reply  Runs applescript/mail-reply.applescript (Mail's own `reply`, so the
+       headers come from Mail) behind gates the script does not have:
+         before: Mail not suspended, screen unlocked, no compose window open,
+                 no other process staging (single-writer lock), source message exists
+         after:  the saved draft's In-Reply-To names a real message in the thread,
+                 References carries it, To: is exactly --to with no display name
+check  Runs the same after-gates on the newest draft with that subject.
+
+Exit 0 only when every gate passes. Nothing here can send.
+"""
+import argparse
+import email
+import fcntl
+import glob
+import os
+import plistlib
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from email.utils import getaddresses
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+MAIL_ROOT = os.path.expanduser("~/Library/Mail")
+REPLY_SCRIPT = ROOT / "applescript" / "mail-reply.applescript"
+VERIFY_BODY = ROOT / "lib" / "verify-draft-body.py"
+LOCK_FILE = Path.home() / "Library" / "Caches" / "hmail" / "mail-staging.lock"
+PREFIX = re.compile(r"^\s*((re|fwd?|aw)\s*:\s*)+", re.I)
+SKIP_BOXES = ("Drafts", "Deleted", "Junk", "Trash", "Spam", "Outbox")
+
+OK, BAD, WAIT = "✔", "✖", "◐"
+
+
+def say(mark, word, text):
+    print(f"{mark} {word}: {text}")
+
+
+# --- Mail's store on disk ---------------------------------------------------
+
+def envelope_index():
+    paths = sorted(glob.glob(os.path.join(MAIL_ROOT, "V*", "MailData", "Envelope Index")))
+    if not paths:
+        sys.exit(f"{BAD} FAILED: no Mail Envelope Index under {MAIL_ROOT}")
+    return sqlite3.connect(f"file:{paths[-1]}?mode=ro", uri=True)
+
+
+def emlx_path(rowid):
+    for p in glob.glob(os.path.join(MAIL_ROOT, "V*", "*", "**", "Messages", f"{rowid}.emlx"),
+                       recursive=True):
+        return p
+    return None
+
+
+def read_headers(path):
+    """Headers of an .emlx. The first line is a byte count, not a header."""
+    raw = Path(path).read_bytes().split(b"\n", 1)[1]
+    return email.message_from_bytes(raw.split(b"\n\n", 1)[0] + b"\n\n")
+
+
+def ids(value):
+    return re.findall(r"<[^<>\s]+>", value or "")
+
+
+def thread_messages(con, subject):
+    """(rowid, sender, date) of every non-draft message carrying this subject."""
+    base = PREFIX.sub("", subject).strip()
+    return con.execute(
+        """select m.ROWID, a.address, datetime(m.date_sent,'unixepoch','localtime'), mb.url
+           from messages m join subjects s on s.ROWID = m.subject
+           join addresses a on a.ROWID = m.sender
+           join mailboxes mb on mb.ROWID = m.mailbox
+           where s.subject = ? order by m.date_sent desc""", (base,)).fetchall()
+
+
+def newest_draft(subject, since=0.0):
+    best, best_mtime = None, since
+    pattern = os.path.join(MAIL_ROOT, "V*", "*", "Drafts.mbox", "**", "Messages", "*.emlx")
+    for p in glob.glob(pattern, recursive=True):
+        if p.endswith(".partial.emlx"):
+            continue
+        mtime = os.stat(p).st_mtime
+        if mtime <= best_mtime:
+            continue
+        try:
+            if (read_headers(p).get("Subject") or "").strip() == subject:
+                best, best_mtime = p, mtime
+        except (OSError, IndexError):
+            continue
+    return best
+
+
+# --- the after-gates (shared by reply and check) ----------------------------
+
+def check_draft(path, want_to, want_cc=None):
+    """Print one line per gate. Return True when all pass."""
+    h = read_headers(path)
+    subject = (h.get("Subject") or "").strip()
+    good = True
+
+    irt = ids(h.get("In-Reply-To"))
+    refs = ids(h.get("References"))
+    if not irt:
+        say(BAD, "NOT THREADED", f'"{subject}" has no In-Reply-To header. It only looks '
+            "like a reply. Restage it with: hmail reply")
+        good = False
+    else:
+        if irt[0] not in refs:
+            say(BAD, "BROKEN CHAIN", f"In-Reply-To {irt[0]} is missing from References")
+            good = False
+        con = envelope_index()
+        parent = None
+        for rowid, sender, date, url in thread_messages(con, subject):
+            if any(b in url for b in SKIP_BOXES):
+                continue
+            p = emlx_path(rowid)
+            if p and irt[0] in ids(read_headers(p).get("Message-Id")):
+                parent = (sender, date)
+                break
+        if parent:
+            say(OK, "THREADED", f"replies to the {parent[1]} message from {parent[0]}")
+        else:
+            # Still a real header; the parent may simply not be stored on this Mac.
+            say(OK, "THREADED", f"In-Reply-To {irt[0]} (parent not found on this Mac)")
+
+    for field, want in (("To", want_to), ("Cc", want_cc)):
+        if want is None:
+            continue
+        got = getaddresses(h.get_all(field) or [])
+        named = [f"{n} <{a}>" for n, a in got if n]
+        addrs = sorted(a.lower() for _, a in got if a)
+        wanted = sorted(a.strip().lower() for a in want if a.strip())
+        if named:
+            say(BAD, "HIJACKED", f"{field} carries a display name {named}. Mail autocomplete "
+                "changed the address. DO NOT SEND this draft.")
+            good = False
+        elif addrs != wanted:
+            say(BAD, "WRONG RECIPIENT", f"{field} is {addrs or 'empty'}, wanted {wanted}. "
+                "DO NOT SEND this draft.")
+            good = False
+        else:
+            say(OK, "RECIPIENT", f"{field} is exactly {', '.join(addrs) or '(none)'}")
+    return good
+
+
+# --- the before-gates -------------------------------------------------------
+
+def osa(script, timeout=30):
+    r = subprocess.run(["/usr/bin/osascript", "-e", script],
+                       capture_output=True, text=True, timeout=timeout)
+    return r.stdout.strip()
+
+
+def preflight():
+    pid = subprocess.run(["/usr/bin/pgrep", "-x", "Mail"], capture_output=True, text=True).stdout.split()
+    if not pid:
+        return "Mail is not running. Open Mail and run again."
+    stat = subprocess.run(["/bin/ps", "-o", "stat=", "-p", pid[0]], capture_output=True, text=True).stdout.strip()
+    if stat.startswith("T"):
+        return f"Mail is suspended (STAT {stat}). Run: kill -CONT {pid[0]}"
+    try:
+        out = subprocess.run(["/usr/sbin/ioreg", "-n", "Root", "-d1", "-a"],
+                             capture_output=True, timeout=10).stdout
+        for user in plistlib.loads(out).get("IOConsoleUsers") or []:
+            if user.get("kCGSSessionOnConsoleKey") and user.get("CGSSessionScreenIsLocked"):
+                return "The screen is locked. The paste lands nowhere when it is locked."
+    except Exception:
+        pass  # a broken probe must never block staging
+    if osa('tell application "Mail" to count of outgoing messages') not in ("", "0"):
+        return ("A compose window is already open in Mail. Close or save it first, so the "
+                "paste cannot land in the wrong message.")
+    return None
+
+
+# --- commands ---------------------------------------------------------------
+
+def cmd_reply(a):
+    body = Path(a.body)
+    if not body.is_file() or not body.read_text().strip():
+        sys.exit(f"{BAD} FAILED: body file is missing or empty: {body}")
+
+    con = envelope_index()
+    src = [r for r in thread_messages(con, a.subject)
+           if a.sender.lower() in (r[1] or "").lower() and not any(b in r[3] for b in SKIP_BOXES)]
+    if not src:
+        sys.exit(f'{BAD} FAILED: no message "{a.subject}" from a sender matching "{a.sender}". '
+                 "Nothing was staged.")
+    full_subject = (read_headers(emlx_path(src[0][0])).get("Subject") or a.subject).strip() \
+        if emlx_path(src[0][0]) else a.subject
+
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(f"{BAD} FAILED: another process is staging mail right now. Wait, then run again.")
+
+    problem = preflight()
+    if problem:
+        sys.exit(f"{BAD} FAILED: {problem} Nothing was staged.")
+
+    started = time.time()
+    args = ["/usr/bin/osascript", str(REPLY_SCRIPT), full_subject, a.sender, str(body), a.to[0]]
+    if a.all:
+        args.append("--all")
+    if a.pre_html:
+        args.append("--pre-html")
+    r = subprocess.run(args, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        sys.exit(f"{BAD} FAILED: {(r.stderr or r.stdout).strip()}")
+    print(r.stdout.strip())
+    reply_subject = r.stdout.split("|")[1].strip() if "|" in r.stdout else "Re: " + PREFIX.sub("", a.subject)
+
+    # Exchange can write the .emlx minutes after the save, so wait for it.
+    path = None
+    for _ in range(36):
+        path = newest_draft(reply_subject, since=started - 5)
+        if path:
+            break
+        time.sleep(5)
+    if not path:
+        say(WAIT, "WAITING", "the draft is saved in Mail but its file is not on disk yet. "
+            f'Run in a few minutes: hmail check "{reply_subject}" --to {a.to[0]}')
+        sys.exit(1)
+    sys.exit(0 if check_draft(path, a.to, [] if not a.all else None) else 1)
+
+
+def cmd_check(a):
+    path = newest_draft(a.subject)
+    if not path:
+        sys.exit(f'{BAD} FAILED: no draft with the subject "{a.subject}" on disk')
+    sys.exit(0 if check_draft(path, a.to) else 1)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("reply", help="stage a threaded reply draft, then verify it")
+    r.add_argument("--subject", required=True, help="subject of the message to reply to")
+    r.add_argument("--from", dest="sender", required=True, help="text that matches its sender")
+    r.add_argument("--to", required=True, action="append", help="the one recipient address")
+    r.add_argument("--body", required=True, help="UTF-8 body file")
+    r.add_argument("--all", action="store_true", help="reply to all (check old CCs first)")
+    r.add_argument("--pre-html", action="store_true", help="body file is already HTML")
+    c = sub.add_parser("check", help="verify the newest draft with this subject")
+    c.add_argument("subject")
+    c.add_argument("--to", action="append", help="expected recipient (repeat for several)")
+    a = ap.parse_args()
+    if a.cmd == "reply" and len(a.to) != 1:
+        ap.error("reply takes exactly one --to; the script replaces recipients with one address")
+    (cmd_reply if a.cmd == "reply" else cmd_check)(a)
+
+
+if __name__ == "__main__":
+    main()
